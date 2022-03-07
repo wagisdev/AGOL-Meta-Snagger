@@ -7,5 +7,5 @@ Take care to update the following variables -
     portal_uName
     portal_pWord !!remember base64 that password or remove the whole decode chunk.
     db_conn
-    timeLookbackWindow !!You will see this around line 883. It is set to 5 days right now, but if you set it to 730 for a full 2 year lookback first, you can get plenty of sample                        data together.
+    timeLookbackWindow !!You will see this around line 883. It is set to 5 days right now, but if you set it to 730 for a full 2 year lookback first, you can get plenty of sample data together.
     
