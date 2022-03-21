@@ -769,9 +769,15 @@ def getMetric(portalID, data_token, itemID, timehackTS):
         url = portal_URL + '/sharing/rest/portals/{}/usage'.format(portalID)
         referrer = portal_URL
 
+    tempTime = datetime.datetime.fromtimestamp(timehackTS/1000.0)
+    deltaTime = datetime.timedelta(days=1)
+    timehackTSE = tempTime + deltaTime
+    timehackTSE = timehackTSE.timestamp()
+    timehackTSE = int(float(timehackTSE)*1000)
+
     values = {'f': 'json',
               'startTime': timehackTS,
-              'endTime': timehackTS,
+              'endTime': timehackTSE,
               'period': '1d',
               'vars': 'num',
               'groupby': 'name',
