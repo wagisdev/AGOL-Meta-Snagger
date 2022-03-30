@@ -14,8 +14,8 @@
 #
 #
 # Created:  3/4/2022
-# Modified:
-# Modification Purpose:
+# Modified: 3/30/2022
+# Modification Purpose: Removed the database thrashing process.
 #
 #
 #-------------------------------------------------------------------------------
@@ -90,9 +90,9 @@ def main():
 # Purpose:  Starts the whole thing.
 #-------------------------------------------------------------------------------
 
-    checkWorkspace()
-    queryPortal (portal_URL, portal_uName, portal_pWord)
-    dataCleaning()
+    #checkWorkspace()
+    #queryPortal (portal_URL, portal_uName, portal_pWord)
+    #dataCleaning()
     buildQueryForFast()
 
     return
@@ -454,6 +454,31 @@ def dataCleaning():
     sqlCommand = '''
 
     update [dbo].[GIS_Content]
+    set [fieldMapsDisabled] = 'FALSE'
+        , [SysCaptureDate] = getdate()
+        where [type] = 'Web Map'
+        and [archived] is NULL
+		and [fieldMapsDisabled] is NULL
+
+    '''
+    cursor.execute(sqlCommand)
+    conn.commit()
+
+    sqlCommand = '''
+
+    update [dbo].[GIS_Content]
+    set [fieldMapsDisabled] = 'N/A'
+        , [SysCaptureDate] = getdate()
+        where [type] <> 'Web Map'
+        and [archived] is NULL
+
+    '''
+    cursor.execute(sqlCommand)
+    conn.commit()
+
+    sqlCommand = '''
+
+    update [dbo].[GIS_Content]
     set [collectorDisabled] = 'TRUE'
         , [SysCaptureDate] = getdate()
         where [type] = 'Web Map'
@@ -612,7 +637,7 @@ def getToken():
               'username': portal_uName,
               'password': base64.b64decode(portal_pWord),
               'referer' : referrer,
-              'expiration' : '60'}
+              'expiration' : '120'}
 
     data = urllib.parse.urlencode(values).encode("utf-8")
     req = urllib.request.Request(url)
@@ -682,7 +707,7 @@ def getMetricTargets():
     select [itemID], [GlobalID], cast ([dateCreated] as date) [dateCreated] 
     from [dbo].[GIS_Content] 
     where [archived] is NULL
-    order by [dateCreated] desc
+    order by [dateCreated] asc
 
     '''
 
@@ -792,14 +817,16 @@ def getMetric(portalID, data_token, itemID, timehackTS):
     while response is None:
         try:
             response = urllib.request.urlopen(req,data=data)
+            #time.sleep (30)
         except:
             pass
-            time.sleep (60)
+            time.sleep (30)
 
     the_page = response.read()
 
     payload_json = the_page.decode('utf8')
     payload_json = json.loads(payload_json)
+
     if len(payload_json['data']) != 0: 
         metricsSTG = payload_json['data']
         useageMeter = int(metricsSTG[0]['num'][0][1])
@@ -814,50 +841,57 @@ def commitStorage(itemID, timehackDT, fkID, portalID, data_token, timehackTS):
 # Purpose:  Commit metrics to storage.
 #-------------------------------------------------------------------------------
 
+    useageMeter = getMetric(portalID, data_token, itemID, timehackTS)
+    print ('Inserting Metrics-- ItemID: {} | Date: {} | Usage: {}'.format(itemID, timehackDT, useageMeter))
+
+    conn = pyodbc.connect(db_conn)
+    cursor = conn.cursor()
+    sqlCommand = '''
+
+    insert into [dbo].[GIS_ContentMetrics] (
+        [itemID]
+        ,[periodDate]
+        ,[requests]
+        ,[archived]
+        ,[SysCaptureDate]
+        ,[FkID]
+        ,[GlobalID]
+    )
+        Values ('{}', '{}', {}, NULL, getdate(), '{}', newid())
+
+    '''.format(itemID, timehackDT, useageMeter, fkID)
+
+    cursor.execute(sqlCommand)
+    conn.commit()
+    conn.close()
+    print ('    Committed....\n')
+
+    return
+
+def getInventory (fkID, itemID):
+#-------------------------------------------------------------------------------
+# Name:        Function - getInventory
+# Purpose:  Get the inventory data.
+#-------------------------------------------------------------------------------
+
     #Check if it exists...
     query_string = '''
 
-    select [GlobalID] from dbo.GIS_ContentMetrics 
+    select [periodDate] from dbo.GIS_ContentMetrics 
     where [itemID] = '{}' and
-    [FkID] = '{}' and
-    [periodDate] = '{}'
+    [FkID] = '{}'
+    order by [periodDate] desc
 
-    '''.format(itemID, fkID, timehackDT)
+    '''.format(itemID, fkID)
 
     query_conn = pyodbc.connect(db_conn)
     query_cursor = query_conn.cursor()
     query_cursor.execute(query_string)
-    db_return = query_cursor.fetchone()
+    db_return = query_cursor.fetchall()
     query_cursor.close()
     query_conn.close()
 
-    if db_return == None:
-        useageMeter = getMetric(portalID, data_token, itemID, timehackTS)
-        print ('Inserting Metrics-- ItemID: {} | Date: {} | Usage: {}'.format(itemID, timehackDT, useageMeter))
-
-        conn = pyodbc.connect(db_conn)
-        cursor = conn.cursor()
-        sqlCommand = '''
-
-        insert into [dbo].[GIS_ContentMetrics] (
-            [itemID]
-            ,[periodDate]
-            ,[requests]
-            ,[archived]
-            ,[SysCaptureDate]
-            ,[FkID]
-            ,[GlobalID]
-        )
-            Values ('{}', '{}', {}, NULL, getdate(), '{}', newid())
-
-        '''.format(itemID, timehackDT, useageMeter, fkID)
-
-        cursor.execute(sqlCommand)
-        conn.commit()
-        conn.close()
-        print ('    Committed....\n')
-
-        return
+    return (db_return)
 
 def queryPortalUsage(workerPayload):
 #-------------------------------------------------------------------------------
@@ -866,17 +900,38 @@ def queryPortalUsage(workerPayload):
 #-------------------------------------------------------------------------------
 
     itemID = workerPayload[0]
-    time.sleep (10)
     fkID = workerPayload[1]
     startRecord = workerPayload[2]
     timeStopWindows = workerPayload[3]
     portalID = workerPayload[4]
     data_token = getToken()
+    listedInventory = getInventory (fkID, itemID)
+    date2BeChecked = []
+    for dateLook in listedInventory:
+        add2List = dateLook[0]
+        date2BeChecked.append(add2List)
+
     for timehacks in timeStopWindows:
         timehackDT = timehacks[0]
         timehackTS = timehacks[1]
+        insertTrigger = 0
+
         if timehackDT >= startRecord:
-            commitStorage(itemID, timehackDT, fkID, portalID, data_token, timehackTS)
+            print ('\nData is within specifications for review.')
+            print ('Check for insert-- ItemID: {} | Date: {} | timehackTS: {}'.format(itemID, timehackDT, timehackTS))
+
+            if len(date2BeChecked) == 0:
+                insertTrigger = 1
+            else:
+                if timehackDT.strftime('%Y-%m-%d') not in [uID.strftime('%Y-%m-%d') for uID in date2BeChecked]:
+                    insertTrigger = 1
+
+            if  insertTrigger == 1:
+                print ('*** No data found. Sending to storage...')
+                commitStorage(itemID, timehackDT, fkID, portalID, data_token, timehackTS)
+            else:
+                print ('*** Data Already stored.')
+
 
     return
 
@@ -886,7 +941,11 @@ def buildQueryForFast():
 # Purpose:  Do more faster.
 #-------------------------------------------------------------------------------
 
-    timeLookbackWindow = 5 #Expressed in days - Max 2 years data available  || Change after first capture to 2
+    if initLoad == 1:
+        timeLookbackWindow = 720 #Expressed in days - Max 2 years data available  || Change after first capture to 2
+    else:
+        timeLookbackWindow = 5
+        
     timeLookbackStop = 1
 
     searchStopDateTS, startDate, zeroTime, searchStopDate = buildSearchStop(timeLookbackStop)
@@ -900,12 +959,17 @@ def buildQueryForFast():
         fkID = asset[1]
         startRecord = asset[2]
         prepData = (itemID, fkID, startRecord, timeStopWindows, portalID)
-        workerPayload.append(prepData)
 
-    print ('Sending Payload....')
+        if initLoad == 1:
+            workerPayload.append(prepData)
+        else:
+            print ('Sending Payload....')
+            queryPortalUsage(prepData)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=None, thread_name_prefix='AGOL_') as executor:
-        executor.map(queryPortalUsage, workerPayload)
+    if initLoad == 1:
+        print ('Sending Payload....')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=None, thread_name_prefix='AGOL_') as executor:
+            executor.map(queryPortalUsage, workerPayload)
 
     return
 
