@@ -90,9 +90,9 @@ def main():
 # Purpose:  Starts the whole thing.
 #-------------------------------------------------------------------------------
 
-    #checkWorkspace()
-    #queryPortal (portal_URL, portal_uName, portal_pWord)
-    #dataCleaning()
+    checkWorkspace()
+    queryPortal (portal_URL, portal_uName, portal_pWord)
+    dataCleaning()
     buildQueryForFast()
 
     return
