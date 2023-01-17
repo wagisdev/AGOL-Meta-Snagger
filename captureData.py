@@ -1,12 +1,12 @@
 #-------------------------------------------------------------------------------
 # Name:        Capture AGOL Metadata & Metrics
-# Purpose:  This script will capture details about assets stored within ArcGIS 
+# Purpose:  This script will capture details about assets stored within ArcGIS
 #           Online along with usage data. Depending on configuration and the
 #           number of assets stored in AGOL, you may experience a long run time.
-#           In testing, ~1800 assets resulted in a first run of 24 hours, with
+#           In testing, ~1900 assets resulted in a first run of 24 hours, with
 #           follow-up updates of about 1 hour to refresh the data. These time
 #           frames were a result of pulling the full 2 years of data from AGOL
-#           as opposed to smaller chunks. 2 years of data for 1800 items
+#           as opposed to smaller chunks. 2 years of data for 1900 items
 #           resulted in ~1M rows in the metrics table.
 #
 # Author:      John Spence
@@ -14,8 +14,9 @@
 #
 #
 # Created:  3/4/2022
-# Modified: 3/30/2022
-# Modification Purpose: Removed the database thrashing process.
+# Modified: 1/15/2023
+# Modification Purpose: Rewrote metrics capture processes. Speed up exponentially.
+#                       (5/17/2022) Added tracking to determine where it came from.
 #
 #
 #-------------------------------------------------------------------------------
@@ -23,7 +24,7 @@
 
 # 888888888888888888888888888888888888888888888888888888888888888888888888888888
 # ------------------------------- Configuration --------------------------------
-#   Adjust the settings below to match your org. eMail functionality is not 
+#   Adjust the settings below to match your org. eMail functionality is not
 #   present currently, though obviously can be built in later.
 #
 # ------------------------------- Dependencies ---------------------------------
@@ -49,12 +50,17 @@ db_conn = ('Driver={ODBC Driver 17 for SQL Server};'  # This will require adjust
                       #r'PWD='     # Comment out if you are using AD authentication.
                       )
 
-# Send confirmation of rebuild to
-adminNotify = 'john@gis.dev'
+# Initial Data Loaad
+initLoad = 0 #Set to 1 if you are wanting a full initial pull.
 
-# Configure the e-mail server and other info here.
-mail_server = 'smtprelay.google.com'
-mail_from = 'Metadata Capture<noreply@gis.dev>'
+# Debug on/off
+debugBIN = 0 #Set to 1 if you want to see the output for each line of code.
+
+# Superspeed
+workFastest = 1 #Increases speed of capturing metrics data.
+
+# Data Source
+dataSource = 'AGOL'
 
 # ------------------------------------------------------------------------------
 # DO NOT UPDATE BELOW THIS LINE OR RISK DOOM AND DISPAIR!  Have a nice day!
@@ -74,7 +80,9 @@ from bs4 import BeautifulSoup
 import urllib
 import requests
 import json
-
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module='bs4')
 
 #-------------------------------------------------------------------------------
 #
@@ -102,7 +110,7 @@ def checkWorkspace():
 # Name:        Function - checkWorkspace
 # Purpose:  Creates the tables, views and indexes needed for the capture & use.
 #-------------------------------------------------------------------------------
-    print ('Connecting...')
+    print ('Checking Database & Configuration...')
     conn = pyodbc.connect(db_conn)
     cursor = conn.cursor()
 
@@ -112,6 +120,7 @@ def checkWorkspace():
                 CREATE TABLE [DBO].[GIS_Content](
                     [itemID] [VARCHAR] (64) NULL
                     , [title] [VARCHAR] (255) NULL
+                    , [source] [VARCHAR] (255) NULL
                     , [type] [VARCHAR] (80) NULL
                     , [metadataScore] [NUMERIC] (3,0) NULL
                     , [owner] [VARCHAR] (100) NULL
@@ -164,9 +173,9 @@ def checkWorkspace():
         Begin
         EXECUTE ('
 
-                CREATE view [dbo].[View_SVC_GISContent] as 
+                CREATE view [dbo].[View_SVC_GISContent] as
 
-                SELECT 
+                SELECT
 	                CAST(ROW_NUMBER() over(order by [dateCreated] asc) as int) as [ObjectID]
 	                , *
                 FROM [dbo].[GIS_Content]')
@@ -183,12 +192,13 @@ def checkWorkspace():
         Begin
         EXECUTE ('
 
-                CREATE View [dbo].[View_SVC_GISMetrics] as 
+                CREATE View [dbo].[View_SVC_GISMetrics] as
 
-                SELECT 
+                SELECT
 	                CAST(ROW_NUMBER() over(order by content.[dateCreated] asc) as int) as [ObjectID]
 	                , content.[itemID]
 	                , content.[title]
+                    , content.[source]
 	                , content.[type]
 	                , content.[owner]
 	                , content.[dateCreated]
@@ -198,47 +208,47 @@ def checkWorkspace():
 	                , content.[fieldMapsDisabled]
 	                , content.[archived]
 	                , content.[SysCaptureDate]
-	                , case 
-		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+	                , case
+		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and metrics.[periodDate] = cast(getdate()-1 as date)) is NULL then 0
-		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and metrics.[periodDate] = cast(getdate()-1 as date))
 	                  end as [TotalUsage_Yesterday]
 	                , case
-		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
-			                and datepart(ww, metrics.[periodDate]) = datepart(ww, cast(getdate() as date))) is null then 0 
-		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
-			                and datepart(ww, metrics.[periodDate]) = datepart(ww, cast(getdate() as date))) 
+		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
+			                and datepart(ww, metrics.[periodDate]) = datepart(ww, cast(getdate() as date))) is null then 0
+		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
+			                and datepart(ww, metrics.[periodDate]) = datepart(ww, cast(getdate() as date)))
 	                  end as [TotalUsage_ThisWeek]
 	                , case
-		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(ww, metrics.[periodDate]) = datepart(ww, cast(getdate() as date))-1) is null then 0
-		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(ww, metrics.[periodDate]) = datepart(ww, cast(getdate() as date))-1)
 	                  end as [TotalUsage_LastWeek]
 	                , case
-		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(mm, metrics.[periodDate]) = datepart(mm, cast(getdate() as date))) is null then 0
-		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(mm, metrics.[periodDate]) = datepart(mm, cast(getdate() as date)))
 	                  end as [TotalUsage_ThisMonth]
 	                , case
-		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(mm, metrics.[periodDate]) = datepart(mm, cast(getdate() as date))-1) is null then 0
-		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(mm, metrics.[periodDate]) = datepart(mm, cast(getdate() as date))-1)
 	                  end as [TotalUsage_LastMonth]
 	                , case
-		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(yy, metrics.[periodDate]) = datepart(yy, cast(getdate() as date))) is null then 0
-		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(yy, metrics.[periodDate]) = datepart(yy, cast(getdate() as date)))
 	                  end as [TotalUsage_ThisYear]
-	                , case 
-		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
+	                , case
+		                when (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
 			                and datepart(yy, metrics.[periodDate]) = datepart(yy, cast(getdate() as date))-1) is null then 0
-		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID] 
-			                and datepart(yy, metrics.[periodDate]) = datepart(yy, cast(getdate() as date))-1) 
+		                else (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]
+			                and datepart(yy, metrics.[periodDate]) = datepart(yy, cast(getdate() as date))-1)
 	                  end as [TotalUsage_LastYear]
 	                , (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]) as [TotalUsage_AllTime]
 
@@ -274,7 +284,7 @@ def queryPortal (portal_URL, portal_uName, portal_pWord):
         print ('Error establishing connection to URL:  {}'.format(errorResponse))
         errorCond = 5
         # Gotta do something with this eventually.
-      
+
     return
 
 def getInfo(gis):
@@ -283,150 +293,36 @@ def getInfo(gis):
 # Purpose:  Snags up to 10,000 items from the portal and processes for capture.
 #-------------------------------------------------------------------------------
 
+    print ('Querying data from specified environment.....')
     search_results = gis.content.search (query='', sort_field='created', sort_order='desc', max_items=10000)
 
+    dataStore = search_results
     for result in search_results:
 
-        print ('Title:  {}'.format(result.title))
-        contentTitle = '{}'.format(result.title)
-        contentTitle = contentTitle.replace("'", '\'\'')
-        contentTitle = '\'{}\''.format(contentTitle)
+        if debugBIN == 1:
+            print ('Title:  {}'.format(result.title))
+            print ('Type:  {}'.format(result.type))
+            print ('Item ID:  {}'.format(result.itemid))
+            print ('Item Metadata Completeness:  {}'.format(result.scoreCompleteness))
+            print ('Item Owner:  {}'.format(owner))
+            print ('Date Created:  {}'.format(dateCreated))
+            print ('Date Updated:  {}\n'.format(dateModified))
+            print ('    Item Snippet:  {}\n'.format(result.snippet))
+            print ('    Item Description:  {}\n'.format(result.description))
+            print ('    Item Terms of Use:  {}\n'.format(result.licenseInfo))
+            print ('    Item Tags:  {}'.format(tag_content))
+            print ('    Item Keywords:  {}'.format(keyword_content))
+            print ('Share Setting:  {}'.format(result.access))
+            print ('Content Status:  {}'.format(result.content_status))
+            print ('Access Information:  {}'.format(result.accessInformation))
+            print ('Protected:  {}'.format(result.protected))
+            print ('Storage Used:  {}'.format(result.size))
+            print ('Number of Views:  {}'.format(result.numViews))
+            print ('Number of Ratings:  {}'.format(result.numRatings))
+            print ('Average Rating:  {}\n'.format(result.avgRating))
 
-        print ('Type:  {}'.format(result.type))
-        contentType = '\'{}\''.format(result.type)
+    sendContent2Storage(dataStore)
 
-        print ('Item ID:  {}'.format(result.itemid))
-        contentID = '\'{}\''.format(result.itemid)
-
-        print ('Item Metadata Completeness:  {}'.format(result.scoreCompleteness))
-        contentmetadataScore = '\'{}\''.format(result.scoreCompleteness)
-        
-        # Make owner data just e-mail or Portal Account
-        owner = result.owner.rstrip('_cobgis')
-        print ('Item Owner:  {}'.format(owner))
-        owner = '\'{}\''.format(owner)
-
-
-        dateCreated = datetime.datetime.fromtimestamp(result.created/1000).strftime('%Y-%m-%d %H:%M:%S')
-        dateModified = datetime.datetime.fromtimestamp(result.modified/1000).strftime('%Y-%m-%d %H:%M:%S')
-        print ('Date Created:  {}'.format(dateCreated))
-        print ('Date Updated:  {}\n'.format(dateModified))
-        dateCreated = '\'{}\''.format(dateCreated)
-        dateModified = '\'{}\''.format(dateModified)
-                     
-        # Item Summary
-        print ('    Item Snippet:  {}\n'.format(result.snippet))
-        if result.snippet != None:
-            soup = BeautifulSoup (result.snippet, 'html.parser')
-            for data in soup (['style', 'script']):
-                data.decompose()
-            resultSnippet = (' '.join(soup.stripped_strings))
-            resultSnippet = resultSnippet.replace("'", '\'\'')
-            itemSummary = '\'{}\''.format(resultSnippet)
-        else:
-            itemSummary = 'NULL'
-
-        # Item Description        
-        print ('    Item Description:  {}\n'.format(result.description))
-        if result.description != None:
-            soup = BeautifulSoup (result.description, 'html.parser')
-            for data in soup (['style', 'script']):
-                data.decompose()
-            resultDescription = (' '.join(soup.stripped_strings))
-            resultDescription = resultDescription.replace("'", '\'\'')
-            itemDescription = '\'{}\''.format(resultDescription)
-        else:
-            itemDescription = 'NULL'
-
-        # Terms of Use
-        print ('    Item Terms of Use:  {}\n'.format(result.licenseInfo))
-        if result.licenseInfo != None:
-            soup = BeautifulSoup (result.licenseInfo, 'html.parser')
-            for data in soup (['style', 'script']):
-                data.decompose()
-            resultTOU = (' '.join(soup.stripped_strings))
-            resultTOU = resultTOU.replace("'", '\'\'')
-            itemTermsofUse = '\'{}\''.format(resultTOU)
-        else:
-            itemTermsofUse = 'NULL'
-        
-        # Setup for pretty Tags
-        tag_content = ''
-        
-        if len(result.tags) > 1:
-            tag_content = result.tags[0]
-            for tag in result.tags:
-                tag_content = '{}, {}'.format(tag_content, tag)
-            tag_content = tag_content.split(', ', 1)
-            tag_content = tag_content[1]
-        elif len(result.tags) == 1:
-            tag_content = '{}'.format(result.tags[0])
-        else:
-            tag_content = 'None'
-        
-        print ('    Item Tags:  {}'.format(tag_content))
-        if tag_content != 'None':
-            itemTags = tag_content.replace("'", '\'\'')
-            itemTags = '\'{}\''.format(itemTags)
-        else:
-            itemTags = 'NULL'
-
-        # Setup for pretty Keywords
-        keyword_content = ''
-        
-        if len(result.typeKeywords) > 1:
-            keyword_content = result.typeKeywords[0]          
-            for keyword in result.typeKeywords:
-                keyword_content = '{}, {}'.format(keyword_content, keyword)
-            keyword_content = keyword_content.split(', ', 1)
-            keyword_content = keyword_content[1]
-        elif len(result.typeKeywords) == 1:
-            keyword_content = '{}'.format(result.typeKeywords[0])
-        else:
-            keyword_content = 'None'
-
-        print ('    Item Keywords:  {}'.format(keyword_content))
-        if keyword_content != 'None':
-            itemKeywords = '\'{}\''.format(keyword_content)
-        else:
-            itemKeywords = 'NULL'
-
-        print ('Share Setting:  {}'.format(result.access))
-        sharingConfig = '\'{}\''.format(result.access)
-
-        print ('Content Status:  {}'.format(result.content_status))
-        if result.content_status != '':
-            contentConfig = '\'{}\''.format(result.content_status)
-        else:
-            contentConfig = 'NULL'
-
-        print ('Access Information:  {}'.format(result.accessInformation))
-        if result.accessInformation != None:
-            contentCredits = '\'{}\''.format(result.accessInformation)
-        else:
-            contentCredits = 'NULL'
-
-        print ('Protected:  {}'.format(result.protected))
-        contentProtected = '\'{}\''.format(result.protected)
-
-        print ('Storage Used:  {}'.format(result.size))
-        storageUsed = '{}'.format(result.size)
-
-        print ('Number of Views:  {}'.format(result.numViews))
-        totalViews = '{}'.format(result.numViews)
-
-        print ('Number of Ratings:  {}'.format(result.numRatings))
-        totalRatings = '{}'.format(result.numRatings)
-
-        print ('Average Rating:  {}'.format(result.avgRating))
-        avgRating = '{}'.format(result.avgRating)
-
-        sendContent2Storage(contentID, contentTitle, contentType, contentmetadataScore, 
-                            owner, dateCreated, dateModified, itemSummary, itemDescription, 
-                            itemTermsofUse, itemTags, itemKeywords, sharingConfig, 
-                            contentConfig, contentCredits, contentProtected, storageUsed, 
-                            totalViews, totalRatings, avgRating)
-                              
     return
 
 def dataCleaning():
@@ -446,8 +342,10 @@ def dataCleaning():
         where [type] = 'Web Map'
         and [archived] is NULL
 		and [itemKeywords] like '%FieldMapsDisabled%'
+        and cast ([SysCaptureDate] as date) = cast (getdate() as date)
+        and [source] = '{}'
 
-    '''
+    '''.format(dataSource)
     cursor.execute(sqlCommand)
     conn.commit()
 
@@ -459,8 +357,11 @@ def dataCleaning():
         where [type] = 'Web Map'
         and [archived] is NULL
 		and [fieldMapsDisabled] is NULL
+        and cast ([SysCaptureDate] as date) = cast (getdate() as date)
+        and [source] = '{}'
 
-    '''
+    '''.format(dataSource)
+
     cursor.execute(sqlCommand)
     conn.commit()
 
@@ -471,8 +372,12 @@ def dataCleaning():
         , [SysCaptureDate] = getdate()
         where [type] <> 'Web Map'
         and [archived] is NULL
+        and [fieldMapsDisabled] is NULL
+        and cast ([SysCaptureDate] as date) = cast (getdate() as date)
+        and [source] = '{}'
 
-    '''
+    '''.format(dataSource)
+
     cursor.execute(sqlCommand)
     conn.commit()
 
@@ -484,8 +389,12 @@ def dataCleaning():
         where [type] = 'Web Map'
         and [archived] is NULL
 		and [itemKeywords] like '%CollectorDisabled%'
+        and [collectorDisabled] is NULL
+        and cast ([SysCaptureDate] as date) = cast (getdate() as date)
+        and [source] = '{}'
 
-    '''
+    '''.format(dataSource)
+
     cursor.execute(sqlCommand)
     conn.commit()
 
@@ -494,10 +403,12 @@ def dataCleaning():
     update [dbo].[GIS_Content]
     set [archived] = 'TRUE'
         , [SysCaptureDate] = getdate()
-	where cast ([SysCaptureDate] as date) <> cast (getdate() as date)
-    and [archived] is NULL
+	   where cast ([SysCaptureDate] as date) <> cast (getdate() as date)
+        and [archived] is NULL
+        and [source] = '{}'
 
-    '''
+    '''.format(dataSource)
+
     cursor.execute(sqlCommand)
     conn.commit()
     conn.close()
@@ -505,118 +416,207 @@ def dataCleaning():
     return
 
 
-def sendContent2Storage(contentID, contentTitle, contentType, contentmetadataScore, 
-                        owner, dateCreated, dateModified, itemSummary, itemDescription,
-                        itemTermsofUse, itemTags, itemKeywords, sharingConfig, 
-                        contentConfig, contentCredits, contentProtected, storageUsed,
-                        totalViews, totalRatings, avgRating):
+def sendContent2Storage(dataStore):
 #-------------------------------------------------------------------------------
 # Name:        Function - sendContent2Storage
 # Purpose:  Fires off the input to the database.
 #-------------------------------------------------------------------------------
 
-    #Check if it exists...
-    query_string = '''
-
-    select [GlobalID] from [dbo].[GIS_Content] where
-        [itemID] = {}
-
-    '''.format(contentID)
-
-    query_conn = pyodbc.connect(db_conn)
+    query_conn = pyodbc.connect(db_conn, autocommit = False)
     query_cursor = query_conn.cursor()
-    query_cursor.execute(query_string)
-    db_return = query_cursor.fetchone()
+
+    print ('\nInserting & Updating Content Data...')
+    for result in tqdm(dataStore):
+
+        contentTitle = '{}'.format(result.title)
+        contentTitle = contentTitle.replace("'", '\'\'')
+        contentTitle = '\'{}\''.format(contentTitle)
+        contentType = '\'{}\''.format(result.type)
+        contentID = '\'{}\''.format(result.itemid)
+        contentmetadataScore = '\'{}\''.format(result.scoreCompleteness)
+        owner = result.owner.rstrip('_instanceName') #Removes additional tag on your GIS data. Change to match yours.
+        owner = '\'{}\''.format(owner)
+        dateCreated = datetime.datetime.fromtimestamp(result.created/1000).strftime('%Y-%m-%d %H:%M:%S')
+        dateModified = datetime.datetime.fromtimestamp(result.modified/1000).strftime('%Y-%m-%d %H:%M:%S')
+        dateCreated = '\'{}\''.format(dateCreated)
+        dateModified = '\'{}\''.format(dateModified)
+        if result.snippet != None:
+            soup = BeautifulSoup (result.snippet, 'lxml')
+            for data in soup (['style', 'script']):
+                data.decompose()
+            resultSnippet = (' '.join(soup.stripped_strings))
+            resultSnippet = resultSnippet.replace("'", '\'\'')
+            itemSummary = '\'{}\''.format(resultSnippet)
+        else:
+            itemSummary = 'NULL'
+        if result.description != None:
+            soup = BeautifulSoup (result.description, 'lxml')
+            for data in soup (['style', 'script']):
+                data.decompose()
+            resultDescription = (' '.join(soup.stripped_strings))
+            resultDescription = resultDescription.replace("'", '\'\'')
+            itemDescription = '\'{}\''.format(resultDescription)
+        else:
+            itemDescription = 'NULL'
+        if result.licenseInfo != None:
+            soup = BeautifulSoup (result.licenseInfo, 'lxml')
+            for data in soup (['style', 'script']):
+                data.decompose()
+            resultTOU = (' '.join(soup.stripped_strings))
+            resultTOU = resultTOU.replace("'", '\'\'')
+            itemTermsofUse = '\'{}\''.format(resultTOU)
+        else:
+            itemTermsofUse = 'NULL'
+        tag_content = ''
+        if len(result.tags) > 1:
+            tag_content = result.tags[0]
+            for tag in result.tags:
+                tag_content = '{}, {}'.format(tag_content, tag)
+            tag_content = tag_content.split(', ', 1)
+            tag_content = tag_content[1]
+        elif len(result.tags) == 1:
+            tag_content = '{}'.format(result.tags[0])
+        else:
+            tag_content = 'None'
+
+        if tag_content != 'None':
+            itemTags = tag_content.replace("'", '\'\'')
+            itemTags = '\'{}\''.format(itemTags)
+        else:
+            itemTags = 'NULL'
+        keyword_content = ''
+
+        if len(result.typeKeywords) > 1:
+            keyword_content = result.typeKeywords[0]
+            for keyword in result.typeKeywords:
+                keyword_content = '{}, {}'.format(keyword_content, keyword)
+            keyword_content = keyword_content.split(', ', 1)
+            keyword_content = keyword_content[1]
+        elif len(result.typeKeywords) == 1:
+            keyword_content = '{}'.format(result.typeKeywords[0])
+        else:
+            keyword_content = 'None'
+
+        if keyword_content != 'None':
+            itemKeywords = '\'{}, {}\''.format(providerSource, keyword_content)
+        else:
+            itemKeywords = 'NULL'
+
+        sharingConfig = '\'{}\''.format(result.access)
+
+        if result.content_status != '':
+            contentConfig = '\'{}\''.format(result.content_status)
+        else:
+            contentConfig = 'NULL'
+
+        if result.accessInformation != None:
+            contentCredits = '\'{}\''.format(result.accessInformation)
+        else:
+            contentCredits = 'NULL'
+        contentProtected = '\'{}\''.format(result.protected)
+        storageUsed = '{}'.format(result.size)
+        totalViews = '{}'.format(result.numViews)
+        totalRatings = '{}'.format(result.numRatings)
+        avgRating = '{}'.format(result.avgRating)
+
+        #Check if it exists...
+        query_string = '''
+
+        select [GlobalID] from [dbo].[GIS_Content] where
+            [itemID] = {}
+
+        '''.format(contentID)
+
+        query_cursor.execute(query_string)
+        db_return = query_cursor.fetchone()
+
+        try:
+            tableFK = db_return[0]
+            if debugBIN == 1:
+                print ('...Updating')
+                print ('\n\n')
+
+            sqlCommand = '''
+
+            update [dbo].[GIS_Content]
+            set [title] = {}
+                , [source] = '{}'
+                , [type] = {}
+                , [metadataScore] = {}
+                , [owner] = {}
+                , [dateCreated] = {}
+                , [dateModified] = {}
+                , [itemSummary] = {}
+                , [itemDescription] = {}
+                , [itemTermsofUse] = {}
+                , [itemTags] = {}
+                , [itemKeywords] = {}
+                , [sharingConfig] = {}
+                , [contentConfig] = {}
+                , [contentCredits] = {}
+                , [contentProtected] = {}
+                , [storageUsed] = {}
+                , [totalViews] = {}
+                , [totalRatings] = {}
+                , [avgRating] = {}
+                , [SysCaptureDate] = getdate()
+                where [GlobalID] = '{}'
+
+            '''.format(contentTitle, dataSource, contentType, contentmetadataScore,
+                       owner, dateCreated, dateModified, itemSummary, itemDescription,
+                       itemTermsofUse, itemTags, itemKeywords, sharingConfig, contentConfig,
+                       contentCredits, contentProtected, storageUsed, totalViews, totalRatings,
+                       avgRating, tableFK)
+
+            query_cursor.execute(sqlCommand)
+
+        except:
+            if debugBIN == 1:
+                print ('...Inserting')
+                print ('\n\n')
+
+            sqlCommand = '''
+
+            insert into [dbo].[GIS_Content] (
+                [itemID]
+                ,[title]
+                ,[source]
+                ,[type]
+                ,[metadataScore]
+                ,[owner]
+                ,[dateCreated]
+                ,[dateModified]
+                ,[itemSummary]
+                ,[itemDescription]
+                ,[itemTermsofUse]
+                ,[itemTags]
+                ,[itemKeywords]
+                ,[sharingConfig]
+                ,[contentConfig]
+                ,[contentCredits]
+                ,[contentProtected]
+                ,[storageUsed]
+                ,[totalViews]
+                ,[totalRatings]
+                ,[avgRating]
+                ,[archived]
+                ,[SysCaptureDate]
+                ,[GlobalID]
+            )
+                Values ({}, {}, '{}',{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
+                {}, {}, {}, {}, {}, NULL, getdate(), newid())
+
+            '''.format(contentID, contentTitle, dataSource, contentType, contentmetadataScore,
+                       owner, dateCreated, dateModified, itemSummary, itemDescription,
+                       itemTermsofUse, itemTags, itemKeywords, sharingConfig, contentConfig,
+                       contentCredits, contentProtected, storageUsed, totalViews, totalRatings,
+                       avgRating)
+
+            query_cursor.execute(sqlCommand)
+
+    query_conn.commit()
     query_cursor.close()
     query_conn.close()
-
-    try:
-        tableFK = db_return[0]
-        print ('...Updating')
-        print ('\n\n')
-        conn = pyodbc.connect(db_conn)
-        cursor = conn.cursor()
-
-        sqlCommand = '''
-
-        update [dbo].[GIS_Content]
-        set [title] = {}
-            , [type] = {}
-            , [metadataScore] = {}
-            , [owner] = {}
-            , [dateCreated] = {}
-            , [dateModified] = {}
-            , [itemSummary] = {}
-            , [itemDescription] = {}
-            , [itemTermsofUse] = {}
-            , [itemTags] = {}
-            , [itemKeywords] = {}
-            , [sharingConfig] = {}
-            , [contentConfig] = {}
-            , [contentCredits] = {}
-            , [contentProtected] = {}
-            , [storageUsed] = {}
-            , [totalViews] = {}
-            , [totalRatings] = {}
-            , [avgRating] = {}
-            , [SysCaptureDate] = getdate()
-            where [GlobalID] = '{}'
-
-        '''.format(contentTitle, contentType, contentmetadataScore, 
-                   owner, dateCreated, dateModified, itemSummary, itemDescription, 
-                   itemTermsofUse, itemTags, itemKeywords, sharingConfig, contentConfig, 
-                   contentCredits, contentProtected, storageUsed, totalViews, totalRatings, 
-                   avgRating, tableFK)
-
-        cursor.execute(sqlCommand)
-        conn.commit()
-        conn.close()
-
-    except:
-        print ('...Inserting')
-        print ('\n\n')
-        conn = pyodbc.connect(db_conn)
-        cursor = conn.cursor()
-        sqlCommand = '''
-
-        insert into [dbo].[GIS_Content] (
-            [itemID]
-            ,[title]
-            ,[type]
-            ,[metadataScore]
-            ,[owner]
-            ,[dateCreated]
-            ,[dateModified]
-            ,[itemSummary]
-            ,[itemDescription]
-            ,[itemTermsofUse]
-            ,[itemTags]
-            ,[itemKeywords]
-            ,[sharingConfig]
-            ,[contentConfig]
-            ,[contentCredits]
-            ,[contentProtected]
-            ,[storageUsed]
-            ,[totalViews]
-            ,[totalRatings]
-            ,[avgRating]
-            ,[archived]
-            ,[SysCaptureDate]
-            ,[GlobalID]
-        )
-            Values ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, 
-            {}, {}, {}, {}, {}, NULL, getdate(), newid())
-
-        '''.format(contentID, contentTitle, contentType, contentmetadataScore, 
-                   owner, dateCreated, dateModified, itemSummary, itemDescription, 
-                   itemTermsofUse, itemTags, itemKeywords, sharingConfig, contentConfig, 
-                   contentCredits, contentProtected, storageUsed, totalViews, totalRatings, 
-                   avgRating)
-
-        cursor.execute(sqlCommand)
-        conn.commit()
-        conn.close()
-
 
     return
 
@@ -643,11 +643,17 @@ def getToken():
     req = urllib.request.Request(url)
 
     response = None
+    attempt = 0
     while response is None:
+        attempt += 1
+        if attempt > 3:
+            time.sleep (10)
+            attempt = 0
         try:
             response = urllib.request.urlopen(req,data=data)
         except:
             pass
+
     the_page = response.read()
 
     #Garbage Collection with some house building
@@ -704,12 +710,13 @@ def getMetricTargets():
 
     query_string = '''
 
-    select [itemID], [GlobalID], cast ([dateCreated] as date) [dateCreated] 
-    from [dbo].[GIS_Content] 
+    select [itemID], [GlobalID], cast ([dateCreated] as date) [dateCreated]
+    from [dbo].[GIS_Content]
     where [archived] is NULL
+    and [source] = '{}'
     order by [dateCreated] asc
 
-    '''
+    '''.format(dataSource)
 
     query_conn = pyodbc.connect(db_conn)
     query_cursor = query_conn.cursor()
@@ -731,7 +738,7 @@ def checkMetricTarget(searchStopDate, fkID):
     select * from [dbo].[GIS_ContentMetrics]
     where [periodDate] = '{}' and [FkID] = '{}'
 
-    '''.format(searchStopDate, fkID) 
+    '''.format(searchStopDate, fkID)
 
     query_conn = pyodbc.connect(db_conn)
     query_cursor = query_conn.cursor()
@@ -810,24 +817,27 @@ def getMetric(portalID, data_token, itemID, timehackTS):
               'name': itemID,
               'token': data_token}
 
+    headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.47 Safari/537.36'}
+
     data = urllib.parse.urlencode(values).encode("utf-8")
-    req = urllib.request.Request(url)
+    req = urllib.request.Request(url, data, headers)
 
     response = None
+    attempt = 0
     while response is None:
+        attempt += 1
+        if attempt > 3:
+            time.sleep (10)
+            attempt = 0
         try:
-            response = urllib.request.urlopen(req,data=data)
-            #time.sleep (30)
+            response = urllib.request.urlopen(req)
         except:
             pass
-            time.sleep (30)
 
-    the_page = response.read()
+    the_page = response.read().decode(response.headers.get_content_charset())
+    payload_json = json.loads(the_page)
 
-    payload_json = the_page.decode('utf8')
-    payload_json = json.loads(payload_json)
-
-    if len(payload_json['data']) != 0: 
+    if len(payload_json['data']) != 0:
         metricsSTG = payload_json['data']
         useageMeter = int(metricsSTG[0]['num'][0][1])
     else:
@@ -835,77 +845,34 @@ def getMetric(portalID, data_token, itemID, timehackTS):
 
     return (useageMeter)
 
-def commitStorage(itemID, timehackDT, fkID, portalID, data_token, timehackTS):
-#-------------------------------------------------------------------------------
-# Name:        Function - commitStorage
-# Purpose:  Commit metrics to storage.
-#-------------------------------------------------------------------------------
-
-    useageMeter = getMetric(portalID, data_token, itemID, timehackTS)
-    print ('Inserting Metrics-- ItemID: {} | Date: {} | Usage: {}'.format(itemID, timehackDT, useageMeter))
-
-    conn = pyodbc.connect(db_conn)
-    cursor = conn.cursor()
-    sqlCommand = '''
-
-    insert into [dbo].[GIS_ContentMetrics] (
-        [itemID]
-        ,[periodDate]
-        ,[requests]
-        ,[archived]
-        ,[SysCaptureDate]
-        ,[FkID]
-        ,[GlobalID]
-    )
-        Values ('{}', '{}', {}, NULL, getdate(), '{}', newid())
-
-    '''.format(itemID, timehackDT, useageMeter, fkID)
-
-    cursor.execute(sqlCommand)
-    conn.commit()
-    conn.close()
-    print ('    Committed....\n')
-
-    return
-
-def getInventory (fkID, itemID):
-#-------------------------------------------------------------------------------
-# Name:        Function - getInventory
-# Purpose:  Get the inventory data.
-#-------------------------------------------------------------------------------
-
-    #Check if it exists...
-    query_string = '''
-
-    select [periodDate] from dbo.GIS_ContentMetrics 
-    where [itemID] = '{}' and
-    [FkID] = '{}'
-    order by [periodDate] desc
-
-    '''.format(itemID, fkID)
-
-    query_conn = pyodbc.connect(db_conn)
-    query_cursor = query_conn.cursor()
-    query_cursor.execute(query_string)
-    db_return = query_cursor.fetchall()
-    query_cursor.close()
-    query_conn.close()
-
-    return (db_return)
-
 def queryPortalUsage(workerPayload):
 #-------------------------------------------------------------------------------
 # Name:        Function - queryPortalUsage
 # Purpose:  Get the useage data.
 #-------------------------------------------------------------------------------
 
+    query_conn = pyodbc.connect(db_conn)
+    query_cursor = query_conn.cursor()
     itemID = workerPayload[0]
     fkID = workerPayload[1]
     startRecord = workerPayload[2]
     timeStopWindows = workerPayload[3]
     portalID = workerPayload[4]
-    data_token = getToken()
-    listedInventory = getInventory (fkID, itemID)
+    data_token = workerPayload[5]
+
+    #Check if it exists...
+    query_string = '''
+
+    select [periodDate] from dbo.GIS_ContentMetrics
+    where [itemID] = '{}' and
+    [FkID] = '{}'
+    order by [periodDate] desc
+
+    '''.format(itemID, fkID)
+
+    query_cursor.execute(query_string)
+    listedInventory = query_cursor.fetchall()
+
     date2BeChecked = []
     for dateLook in listedInventory:
         add2List = dateLook[0]
@@ -917,8 +884,9 @@ def queryPortalUsage(workerPayload):
         insertTrigger = 0
 
         if timehackDT >= startRecord:
-            print ('\nData is within specifications for review.')
-            print ('Check for insert-- ItemID: {} | Date: {} | timehackTS: {}'.format(itemID, timehackDT, timehackTS))
+            if debugBIN == 1:
+                print ('\nData is within specifications for review.')
+                print ('Check for insert-- ItemID: {} | Date: {} | timehackTS: {}'.format(itemID, timehackDT, timehackTS))
 
             if len(date2BeChecked) == 0:
                 insertTrigger = 1
@@ -927,13 +895,41 @@ def queryPortalUsage(workerPayload):
                     insertTrigger = 1
 
             if  insertTrigger == 1:
-                print ('*** No data found. Sending to storage...')
-                commitStorage(itemID, timehackDT, fkID, portalID, data_token, timehackTS)
+                if debugBIN == 1:
+                    print ('*** No data found. Sending to storage...')
+                useageMeter = getMetric(portalID, data_token, itemID, timehackTS)
+                if debugBIN ==1:
+                    print ('Inserting Metrics-- ItemID: {} | Date: {} | Usage: {}'.format(itemID, timehackDT, useageMeter))
+
+                conn = pyodbc.connect(db_conn)
+                cursor = conn.cursor()
+                sqlCommand = '''
+
+                insert into [dbo].[GIS_ContentMetrics] (
+                    [itemID]
+                    ,[periodDate]
+                    ,[requests]
+                    ,[archived]
+                    ,[SysCaptureDate]
+                    ,[FkID]
+                    ,[GlobalID]
+                )
+                    Values ('{}', '{}', {}, NULL, getdate(), '{}', newid())
+
+                '''.format(itemID, timehackDT, useageMeter, fkID)
+
+                query_cursor.execute(sqlCommand)
+                if debugBIN ==1:
+                    print ('    Committed....\n')
             else:
-                print ('*** Data Already stored.')
+                if debugBIN == 1:
+                    print ('*** Data Already stored.')
 
+    query_conn.commit()
+    query_cursor.close()
+    query_conn.close()
 
-    return
+    return ()
 
 def buildQueryForFast():
 #-------------------------------------------------------------------------------
@@ -945,34 +941,37 @@ def buildQueryForFast():
         timeLookbackWindow = 720 #Expressed in days - Max 2 years data available  || Change after first capture to 2
     else:
         timeLookbackWindow = 5
-        
+
     timeLookbackStop = 1
 
     searchStopDateTS, startDate, zeroTime, searchStopDate = buildSearchStop(timeLookbackStop)
     timeStopWindows = buildDateWindow(startDate, zeroTime, timeLookbackWindow, searchStopDateTS)
     portalID = getPortalID()
     db_return = getMetricTargets()
+    data_token = getToken()
 
     workerPayload = []
-    for asset in db_return:
-        itemID = asset[0]
-        fkID = asset[1]
-        startRecord = asset[2]
-        prepData = (itemID, fkID, startRecord, timeStopWindows, portalID)
-
-        if initLoad == 1:
+    print ('\nBuilding Payload For Metrics Scan & Capture....')
+    if initLoad == 1 or workFastest == 1:
+        for asset in db_return:
+            itemID = asset[0]
+            fkID = asset[1]
+            startRecord = asset[2]
+            prepData = (itemID, fkID, startRecord, timeStopWindows, portalID, data_token)
             workerPayload.append(prepData)
-        else:
-            print ('Sending Payload....')
+        print ('    -- Sending Payload....')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=None, thread_name_prefix='AGOL_') as executor:
+            results = list(tqdm(executor.map(queryPortalUsage, workerPayload), total = len(workerPayload)))
+    else:
+        print ('\nSending Payloads For Metrics Scan & Capture via slow-mo mode....')
+        for asset in tqdm(db_return):
+            itemID = asset[0]
+            fkID = asset[1]
+            startRecord = asset[2]
+            prepData = (itemID, fkID, startRecord, timeStopWindows, portalID, data_token)
             queryPortalUsage(prepData)
 
-    if initLoad == 1:
-        print ('Sending Payload....')
-        with concurrent.futures.ThreadPoolExecutor(max_workers=None, thread_name_prefix='AGOL_') as executor:
-            executor.map(queryPortalUsage, workerPayload)
-
     return
-
 
 #-------------------------------------------------------------------------------
 #
