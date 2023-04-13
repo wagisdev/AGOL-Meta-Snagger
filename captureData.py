@@ -14,8 +14,9 @@
 #
 #
 # Created:  3/4/2022
-# Modified: 1/15/2023
-# Modification Purpose: Rewrote metrics capture processes. Speed up exponentially.
+# Modified: 4/13/2023
+# Modification Purpose: Capturing data sources for webmaps.
+#			(1/15/2023) Rewrote metrics capture processes. Speed up exponentially.
 #                       (5/17/2022) Added tracking to determine where it came from.
 #
 #
@@ -68,6 +69,7 @@ dataSource = 'AGOL'
 
 import arcgis
 from arcgis.gis import GIS
+from arcgis.mapping import WebMap
 import datetime
 import time
 import smtplib
@@ -102,6 +104,7 @@ def main():
     queryPortal (portal_URL, portal_uName, portal_pWord)
     dataCleaning()
     buildQueryForFast()
+    getWebMapSources(portal_URL, portal_uName, portal_pWord)
 
     return
 
@@ -166,6 +169,25 @@ def checkWorkspace():
     '''
     cursor.execute(sqlCommand)
     conn.commit()
+	
+    sqlCommand = '''
+    IF OBJECT_ID ('[DBO].[GIS_ContentSources]' , N'U') IS NULL
+		    Begin
+                CREATE TABLE [DBO].[GIS_ContentSources]( 
+                    [layerID] [VARCHAR] (255) NULL
+                    , [layerTitle] [VARCHAR] (255) NULL
+                    , [layerType] [VARCHAR] (100) NULL
+                    , [layerSource] [VARCHAR] (255) NULL
+                    , [layerVisibility] [VARCHAR] (5) NULL
+                    , [layerTest] [VARCHAR] (5) NULL
+                    , [SysCaptureDate] [DATETIME2] (7) NULL
+                    , [FkID] [UNIQUEIDENTIFIER] NOT NULL
+                    , [GlobalID] [UNIQUEIDENTIFIER] NOT NULL
+                )
+            End
+    '''
+    cursor.execute(sqlCommand)
+    conn.commit()	
 
     sqlCommand = '''
     IF OBJECT_ID ('[DBO].[View_SVC_GISContent]') IS NULL
@@ -970,6 +992,233 @@ def buildQueryForFast():
             startRecord = asset[2]
             prepData = (itemID, fkID, startRecord, timeStopWindows, portalID, data_token)
             queryPortalUsage(prepData)
+
+    return
+
+def getWebMapSources(portal_URL, portal_uName, portal_pWord):
+#-------------------------------------------------------------------------------
+# Name:        Function - getWebMapSources
+# Purpose:  
+#-------------------------------------------------------------------------------
+    errorLoc = 'queryPortal'
+
+    try:
+        portal_pWordDec = base64.b64decode(portal_pWord).decode("utf-8")
+        gis = GIS('{}'.format(portal_URL), '{}'.format(portal_uName), '{}'.format(portal_pWordDec))
+        errorCond = 0
+        errorResponse = ''
+
+    except Exception as errorResponse:
+        print ('Error establishing connection to URL:  {}'.format(errorResponse))
+        errorCond = 5
+        # Gotta do something with this eventually.
+        return
+
+    query_conn = pyodbc.connect(db_conn)
+    query_cursor = query_conn.cursor()
+
+    sqlCommand = '''
+
+    truncate table [dbo].[GIS_ContentSources]
+
+    '''
+
+    query_cursor.execute(sqlCommand)
+    query_conn.commit()
+
+    #Check if it exists...
+    query_string = '''
+
+    select 
+	    [itemID]
+	    , [GlobalID]
+    from [dbo].[GIS_Content] where [type] = 'Web Map' and [archived] is NULL
+    order by [dateModified] desc
+
+    '''
+
+    query_cursor.execute(query_string)
+    mapInventory = query_cursor.fetchall()
+
+    print ('\nCapturing Webmap Data Sources....')
+
+    for wmf in tqdm(mapInventory):
+        wmSearch = wmf[0]
+        fkID = wmf[1]
+
+        wmItem = gis.content.get(wmSearch)
+        webMap = WebMap(wmItem)
+        #print ('Title:  {}'.format(wmItem.title))
+        wmTitle = wmItem.title
+        #print ('Item ID:  {}'.format(wmSearch))
+        #print ('----------------------------------------------')
+        if len(webMap.layers)>0:
+            for layer in webMap.layers:
+                try:
+                    if layer.layerType == 'GroupLayer':
+                        for grpdlayer in layer.layers:
+                            if grpdlayer.layerType == 'GroupLayer':
+                                for grpdlayer2 in grpdlayer.layers:
+                                    if grpdlayer2.layerType == 'GroupLayer':
+                                        for grpdlayer3 in grpdlayer2.layers:
+                                            layerTitle = grpdlayer3.title
+                                            layerID = grpdlayer3.id
+                                            try:
+                                                layerType = grpdlayer3.layerType
+                                                if grpdlayer3.layerType != 'VectorTileLayer':
+                                                    try:
+                                                        layerURL = grpdlayer3.url
+                                                    except:
+                                                        layerURL = None
+                                                else:
+                                                    try:
+                                                        layerItemID = grpdlayer3.itemId
+                                                        layerURL = layerItemID
+                                                    except:
+                                                        layerItemID = None
+                                                        layerURL = layerItemID
+                                            except:
+                                                layerType = None
+                                                try:
+                                                    layerURL = grpdlayer3.url
+                                                except:
+                                                    layerURL = None
+                                            try:
+                                                layerVisibility = grpdlayer3.visibility
+                                            except:
+                                                layerVisibility = None
+                                    else:
+                                        layerTitle = grpdlayer2.title
+                                        layerID = grpdlayer2.id
+                                        try:
+                                            layerType = grpdlayer2.layerType
+                                            if grpdlayer2.layerType != 'VectorTileLayer':
+                                                try:
+                                                    layerURL = grpdlayer2.url
+                                                except:
+                                                    layerURL = None
+                                            else:
+                                                try:
+                                                    layerItemID = grpdlayer2.itemId
+                                                    layerURL = layerItemID
+                                                except:
+                                                    layerItemID = None
+                                                    layerURL = layerItemID
+                                        except:
+                                            layerType = None
+                                            try:
+                                                layerURL = grpdlayer2.url
+                                            except:
+                                                layerURL = None
+                                        try:
+                                            layerVisibility = grpdlayer2.visibility
+                                        except:
+                                            layerVisibility = None
+                            else:
+                                layerTitle = grpdlayer.title
+                                layerID = grpdlayer.id
+                                try:
+                                    layerType = grpdlayer.layerType
+                                    if grpdlayer.layerType != 'VectorTileLayer':
+                                        try:
+                                            layerURL = grpdlayer.url
+                                        except:
+                                            layerURL = None
+                                    else:
+                                        try:
+                                            layerItemID = grpdlayer.itemId
+                                            layerURL = layerItemID
+                                        except:
+                                            layerItemID = None
+                                            layerURL = layerItemID
+                                except:
+                                    layerType = None
+                                    try:
+                                        layerURL = grpdlayer.url
+                                    except:
+                                        layerURL = None
+                                try:
+                                    layerVisibility = grpdlayer.visibility
+                                except:
+                                    layerVisibility = None
+                    else:
+                        layerTitle = layer.title
+                        layerID = layer.id
+                        try:
+                            layerType = layer.layerType
+                            if layer.layerType != 'VectorTileLayer':
+                                try:
+                                    layerURL = layer.url
+                                except:
+                                    layerURL = None
+                            else:
+                                try:
+                                    layerItemID = layer.itemId
+                                    layerURL = layerItemID
+                                except:
+                                    layerItemID = None
+                                    layerURL = layerItemID
+                        except:
+                            layerType = None
+                            try:
+                                layerURL = layer.url
+                            except:
+                                layerURL = None
+                        try:
+                            layerVisibility = layer.visibility
+                        except:
+                            layerVisibility = None
+                except:
+                    layerTitle = layer.title
+                    layerID = layer.id
+                    layerType = None
+                    try:
+                        layerURL = layer.url
+                    except:
+                        layerURL = None
+                    try:
+                        layerVisibility = layer.visibility
+                    except:
+                        layerVisibility = None
+
+                #print ('    Layer Title:  {}'.format(layerTitle))
+                #print ('    Layer Map ID: {}'.format(layerID))
+                #print ('    Layer Type: {}'.format(layerType))
+                #print ('    Layer Source URL: {}'.format(layerURL))
+                #print ('    Layer Default Visibility: {}\n'.format(layerVisibility))
+                layerTitle = layerTitle.replace('\'', '')
+                if layerType == None:
+                    layerType = 'NULL'
+                else:
+                    layerType = '\'{}\''.format(layerType)
+                if layerURL == None:
+                    layerURL = 'NULL'
+                else:
+                    layerURL = '\'{}\''.format(layerURL)
+
+                sqlCommand = '''
+
+                insert into [dbo].[GIS_ContentSources] (
+                    [layerID]
+                    ,[layerTitle]
+                    ,[layerType]
+                    ,[layerSource]
+                    ,[layerVisibility]
+                    ,[layerTest]
+                    ,[SysCaptureDate]
+                    ,[FkID]
+                    ,[GlobalID]
+                )
+                    Values ('{}', '{}', {}, {}, '{}', NULL, getdate(), '{}', newid())
+
+                '''.format(layerID, layerTitle, layerType, layerURL, layerVisibility, fkID)
+
+                query_cursor.execute(sqlCommand)
+
+
+    query_conn.commit()
+    query_cursor.close()
+    query_conn.close()
 
     return
 
