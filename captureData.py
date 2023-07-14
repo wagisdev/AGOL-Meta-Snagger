@@ -14,8 +14,9 @@
 #
 #
 # Created:  3/4/2022
-# Modified: 4/13/2023
-# Modification Purpose: Capturing data sources for webmaps.
+# Modified: 7/14/2023
+# Modification Purpose: (7/14/2023) Added in backup mechanism, capturing asset configuration information.
+#			(4/13/2023) Capturing data sources for webmaps.
 #			(1/15/2023) Rewrote metrics capture processes. Speed up exponentially.
 #                       (5/17/2022) Added tracking to determine where it came from.
 #
@@ -105,6 +106,7 @@ def main():
     dataCleaning()
     buildQueryForFast()
     getWebMapSources(portal_URL, portal_uName, portal_pWord)
+    disasterStore()
 
     return
 
@@ -169,7 +171,7 @@ def checkWorkspace():
     '''
     cursor.execute(sqlCommand)
     conn.commit()
-	
+
     sqlCommand = '''
     IF OBJECT_ID ('[DBO].[GIS_ContentSources]' , N'U') IS NULL
 		    Begin
@@ -187,7 +189,25 @@ def checkWorkspace():
             End
     '''
     cursor.execute(sqlCommand)
-    conn.commit()	
+    conn.commit()
+
+    sqlCommand = '''
+    IF OBJECT_ID ('[DBO].[GIS_ContentConfig]' , N'U') IS NULL
+		    Begin
+                CREATE TABLE [DBO].[GIS_ContentConfig]( 
+                    [itemID] [VARCHAR] (64) NULL
+                    , [dateModified] [DATETIME2] (7) NULL
+                    , [description] [NVARCHAR] (MAX) NULL
+                    , [data] [NVARCHAR] (MAX) NULL
+                    , [archived] [VARCHAR] (5) NULL
+                    , [SysCaptureDate] [DATETIME2] (7) NULL
+                    , [FkID] [UNIQUEIDENTIFIER] NOT NULL
+                    , [GlobalID] [UNIQUEIDENTIFIER] NOT NULL
+                )
+            End
+    '''
+    cursor.execute(sqlCommand)
+    conn.commit()
 
     sqlCommand = '''
     IF OBJECT_ID ('[DBO].[View_SVC_GISContent]') IS NULL
@@ -275,6 +295,34 @@ def checkWorkspace():
 	                , (select SUM(metrics.[requests]) from [dbo].[GIS_ContentMetrics] metrics where metrics.[FkID] = content.[GlobalID]) as [TotalUsage_AllTime]
 
                   FROM [dbo].[GIS_Content] as content')
+        END
+
+    '''
+
+    cursor.execute(sqlCommand)
+    conn.commit()
+
+    sqlCommand = '''
+    IF OBJECT_ID ('[DBO].[View_SVC_GISContentSources]') IS NULL
+
+        Begin
+        EXECUTE ('
+            CREATE view [DBO].[View_SVC_GISContentSources] as 
+                select 
+	                CAST(ROW_NUMBER() over(order by [sources].[globalID] asc) as int) as [ObjectID]
+	                , [content].[itemID]
+	                , [content].[title]
+	                , [content].[source]
+	                , [content].[type]
+	                , [content].[owner]
+	                , [content].[dateModified]
+	                , [sources].[layerID]
+	                , [sources].[layerTitle]
+	                , [sources].[layerType]
+	                , [sources].[layerSource]
+                from [DBO].GIS_Content as [content]
+                inner join [DBO].[GIS_ContentSources] as [sources] on [sources].FkID = [content].[GlobalID]
+                ')
         END
 
     '''
@@ -456,7 +504,7 @@ def sendContent2Storage(dataStore):
         contentType = '\'{}\''.format(result.type)
         contentID = '\'{}\''.format(result.itemid)
         contentmetadataScore = '\'{}\''.format(result.scoreCompleteness)
-        owner = result.owner.rstrip('_instanceName') #Removes additional tag on your GIS data. Change to match yours.
+        owner = result.owner.rstrip('_cobgis')
         owner = '\'{}\''.format(owner)
         dateCreated = datetime.datetime.fromtimestamp(result.created/1000).strftime('%Y-%m-%d %H:%M:%S')
         dateModified = datetime.datetime.fromtimestamp(result.modified/1000).strftime('%Y-%m-%d %H:%M:%S')
@@ -1217,6 +1265,150 @@ def getWebMapSources(portal_URL, portal_uName, portal_pWord):
 
 
     query_conn.commit()
+    query_cursor.close()
+    query_conn.close()
+
+
+
+    return
+
+def disasterStore():
+#-------------------------------------------------------------------------------
+# Name:        Function - disasterStore
+# Purpose:  
+#-------------------------------------------------------------------------------
+    errorLoc = 'disasterStore'
+
+    query_conn = pyodbc.connect(db_conn)
+    query_cursor = query_conn.cursor()
+
+    query_string = '''
+
+    select 
+	    [itemID]
+	    , [GlobalID]
+        , [dateModified]
+    from [dbo].[GIS_Content] where [source] = '{}' and [archived] is NULL
+    and cast(dateModified as date) = cast(getdate()-1 as date)
+    order by [dateModified] desc
+
+    '''.format(dataSource)
+
+    query_cursor.execute(query_string)
+    fullInventory = query_cursor.fetchall()
+    data_token = getToken()
+
+    print ('\nBacking Up Changes...')
+
+    for item in tqdm(fullInventory):
+        itemID = '{}'.format(item[0])
+        fkID = '{}'.format(item[1])
+        dateModified = '{}'.format(item[2])
+
+        if portal_URL[-1] == '/':
+            url = portal_URL + 'sharing/rest/content/items/{}/description'.format(itemID)
+            referrer = portal_URL[0: -1]
+        else:
+            url = portal_URL + '/sharing/rest/content/items/{}/description'.format(itemID)
+            referrer = portal_URL
+
+        values = {'f': 'pjson',
+                  'token': data_token}
+
+        data = urllib.parse.urlencode(values).encode("utf-8")
+        req = urllib.request.Request(url)
+
+        response = None
+        while response is None:
+            try:
+                response = urllib.request.urlopen(req,data=data)
+            except:
+                pass
+        the_page = response.read()
+        payload_json = the_page.decode('utf8')
+        payloadDescription = json.loads(payload_json)
+        payloadDescription = json.dumps(payloadDescription, indent=4)
+
+        try: 
+            if portal_URL[-1] == '/':
+                url = portal_URL + 'sharing/rest/content/items/{}/data'.format(itemID)
+                referrer = portal_URL[0: -1]
+            else:
+                url = portal_URL + '/sharing/rest/content/items/{}/data'.format(itemID)
+                referrer = portal_URL
+
+            values = {'f': 'pjson',
+                      'token': data_token}
+
+            data = urllib.parse.urlencode(values).encode("utf-8")
+            req = urllib.request.Request(url)
+
+            response = None
+            while response is None:
+                try:
+                    response = urllib.request.urlopen(req,data=data)
+                except:
+                    pass
+            the_page = response.read()
+            payload_json = the_page.decode('utf8')
+            payloadData = json.loads(payload_json)
+            payloadData = json.dumps(payloadData, indent=4)
+        except:
+            payloadData = 'Cannot Access Data JSON'
+
+        payloadDescription = r'{}'.format(payloadDescription.replace('\'', '\'\''))
+        payloadData = r'{}'.format(payloadData.replace('\'', '\'\''))
+
+        sqlCommand = '''
+
+        insert into [dbo].[GIS_ContentConfig] (
+            [itemID]
+            ,[dateModified]
+            ,[description]
+            ,[data]
+            ,[archived]
+            ,[SysCaptureDate]
+            ,[FkID]
+            ,[GlobalID]
+        )
+            Values ('{}', '{}', '{}', '{}', NULL, getdate(), '{}', newid())
+
+        '''.format(itemID, dateModified, payloadDescription, payloadData, fkID)
+
+        query_cursor.execute(sqlCommand)
+        query_conn.commit()
+
+    query_string = '''
+
+    select 
+	    [itemID]
+	    , [GlobalID]
+        , [dateModified]
+    from [dbo].[GIS_Content] where [source] = '{}' and [archived] is not NULL
+    and cast(SysCaptureDate as date) = cast(getdate()-1 as date)
+    order by [dateModified] desc
+
+    '''.format(dataSource)
+
+    query_cursor.execute(query_string)
+    archivedInventory = query_cursor.fetchall()
+
+    for item in archivedInventory:
+        itemID = '{}'.format(item[0])
+        fkID = '{}'.format(item[1])
+        dateModified = '{}'.format(item[2])
+
+        sqlCommand = '''
+
+        update [dbo].[GIS_ContentConfig]
+        set [archived] = 'TRUE'
+	       where fkid = '{}'
+            and [archived] is NULL
+        '''.format(fkID)
+
+        query_cursor.execute(sqlCommand)
+        query_conn.commit()
+
     query_cursor.close()
     query_conn.close()
 
